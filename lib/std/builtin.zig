@@ -810,7 +810,9 @@ pub const CompilerBackend = enum(u64) {
     /// The reference implementation self-hosted compiler of Zig, using the
     /// sparc64 backend.
     stage2_sparc64 = 10,
-
+    /// The reference implementation self-hosted compiler of Zig, using the
+    /// m68k backend.
+    stage2_m68k = 11,
     _,
 };
 

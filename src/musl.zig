@@ -268,6 +268,7 @@ pub fn archName(arch: std.Target.Cpu.Arch) [:0]const u8 {
         .powerpc => return "powerpc",
         .powerpc64, .powerpc64le => return "powerpc64",
         .riscv64 => return "riscv64",
+        .m68k => return "m68k",
         .s390x => return "s390x",
         .wasm32, .wasm64 => return "wasm",
         .x86_64 => return "x86_64",

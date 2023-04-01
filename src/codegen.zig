@@ -80,6 +80,7 @@ pub fn generateFunction(
         .aarch64_32,
         => return @import("arch/aarch64/CodeGen.zig").generate(bin_file, src_loc, func, air, liveness, code, debug_output),
         .riscv64 => return @import("arch/riscv64/CodeGen.zig").generate(bin_file, src_loc, func, air, liveness, code, debug_output),
+        .m68k => return @import("arch/m68k/CodeGen.zig").generate(bin_file, src_loc, func, air, liveness, code, debug_output),
         .sparc64 => return @import("arch/sparc64/CodeGen.zig").generate(bin_file, src_loc, func, air, liveness, code, debug_output),
         .x86_64 => return @import("arch/x86_64/CodeGen.zig").generate(bin_file, src_loc, func, air, liveness, code, debug_output),
         .wasm32,

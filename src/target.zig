@@ -136,6 +136,7 @@ pub fn osArchName(target: std.Target) [:0]const u8 {
             .mips, .mipsel, .mips64, .mips64el => "mips",
             .powerpc, .powerpcle, .powerpc64, .powerpc64le => "powerpc",
             .riscv32, .riscv64 => "riscv",
+            .m68k => "m68k",
             .sparc, .sparcel, .sparc64 => "sparc",
             .x86, .x86_64 => "x86",
             else => @tagName(target.cpu.arch),
