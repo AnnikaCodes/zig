@@ -14,7 +14,6 @@ pub const Inst = struct {
 
         // Add decimal with extend
         ABCD,
-
         // Add
         ADD,
         // Add address
