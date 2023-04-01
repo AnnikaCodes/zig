@@ -1,4 +1,11 @@
 // TODO
+const std = @import("std");
+
+instructions: std.MultiArrayList(Inst).Slice,
+/// The meaning of this data is determined by `Inst.Tag` value.
+extra: []const u32,
+
+const Mir = @This();
 
 pub const Inst = struct {
     // TODO
@@ -209,3 +216,9 @@ pub const Inst = struct {
         MOVE_from_SR,
     };
 };
+
+pub fn deinit(mir: *Mir, gpa: std.mem.Allocator) void {
+    mir.instructions.deinit(gpa);
+    gpa.free(mir.extra);
+    mir.* = undefined;
+}
