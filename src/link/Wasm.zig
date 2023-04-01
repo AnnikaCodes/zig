@@ -1352,6 +1352,7 @@ pub fn updateFunc(wasm: *Wasm, mod: *Module, func: *Module.Fn, air: Air, livenes
         liveness,
         &code_writer,
         .none,
+        mod,
     );
 
     const code = switch (result) {

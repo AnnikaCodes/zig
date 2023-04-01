@@ -2120,9 +2120,9 @@ pub fn updateFunc(self: *MachO, module: *Module, func: *Module.Fn, air: Air, liv
     const res = if (decl_state) |*ds|
         try codegen.generateFunction(&self.base, decl.srcLoc(), func, air, liveness, &code_buffer, .{
             .dwarf = ds,
-        })
+        }, module)
     else
-        try codegen.generateFunction(&self.base, decl.srcLoc(), func, air, liveness, &code_buffer, .none);
+        try codegen.generateFunction(&self.base, decl.srcLoc(), func, air, liveness, &code_buffer, .none, module);
 
     var code = switch (res) {
         .ok => code_buffer.items,

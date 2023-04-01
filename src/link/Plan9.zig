@@ -311,6 +311,7 @@ pub fn updateFunc(self: *Plan9, module: *Module, func: *Module.Fn, air: Air, liv
                 .pcop_change_index = &pcop_change_index,
             },
         },
+        module,
     );
     const code = switch (res) {
         .ok => try code_buffer.toOwnedSlice(),

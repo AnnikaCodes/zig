@@ -2505,9 +2505,9 @@ pub fn updateFunc(self: *Elf, module: *Module, func: *Module.Fn, air: Air, liven
     const res = if (decl_state) |*ds|
         try codegen.generateFunction(&self.base, decl.srcLoc(), func, air, liveness, &code_buffer, .{
             .dwarf = ds,
-        })
+        }, module)
     else
-        try codegen.generateFunction(&self.base, decl.srcLoc(), func, air, liveness, &code_buffer, .none);
+        try codegen.generateFunction(&self.base, decl.srcLoc(), func, air, liveness, &code_buffer, .none, module);
 
     const code = switch (res) {
         .ok => code_buffer.items,

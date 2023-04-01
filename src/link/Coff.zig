@@ -1038,6 +1038,7 @@ pub fn updateFunc(self: *Coff, module: *Module, func: *Module.Fn, air: Air, live
         liveness,
         &code_buffer,
         .none,
+        module
     );
     var code = switch (res) {
         .ok => code_buffer.items,
