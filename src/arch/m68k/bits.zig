@@ -26,4 +26,9 @@ pub const Register = enum(u8) {
 
     // condition code register
     ccr,
+
+    /// TODO: make this the actual code used in machine code
+    pub fn id(self: Register) u8 {
+        return @enumToInt(self);
+    }
 };

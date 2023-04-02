@@ -12,3 +12,14 @@ pub const callee_preserved_regs = [_]Register{
 
 const allocatable_registers = callee_preserved_regs ++ caller_preserved_regs;
 pub const RegisterManager = RegisterManagerFn(@import("CodeGen.zig"), Register, &allocatable_registers);
+const RegisterBitSet = RegisterManager.RegisterBitSet;
+pub const RegisterClass = struct {
+    pub const gp: RegisterBitSet = blk: {
+        var set = RegisterBitSet.initEmpty();
+        for (callee_preserved_regs) |reg| {
+            const index = RegisterManager.indexOfRegIntoTracked(reg).?;
+            set.set(index);
+        }
+        break :blk set;
+    };
+};

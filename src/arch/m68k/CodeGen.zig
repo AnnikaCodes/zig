@@ -108,7 +108,7 @@ const MCValue = union(enum) {
     undef,
     /// A pointer-sized integer that fits in a register.
     /// If the type is a pointer, this is the pointer address in virtual address space.
-    immediate: u64,
+    immediate: u32,
     /// The value is in a target-specific register.
     register: Register,
     /// The value is in memory at a hard-coded address.
@@ -169,6 +169,17 @@ const BigTomb = struct {
 };
 
 const Self = @This();
+
+
+/// TODO support scope overrides. Also note this logic is duplicated with `Module.wantSafety`.
+fn wantSafety(self: *Self) bool {
+    return switch (self.bin_file.options.optimize_mode) {
+        .Debug => true,
+        .ReleaseSafe => true,
+        .ReleaseFast => false,
+        .ReleaseSmall => false,
+    };
+}
 
 pub fn generate(
     bin_file: *link.File,
@@ -295,8 +306,74 @@ pub fn addExtraAssumeCapacity(self: *Self, extra: anytype) u32 {
 }
 
 fn gen(self: *Self) !void {
-    _ = self;
-    std.debug.panic("TODO: implement m68k CodeGen.gen", .{});
+    const cc = self.fn_type.fnCallingConvention();
+    // who even knows
+
+    // ok so i think this is something called a Function Prologue and Epilogue,
+    // https://en.wikipedia.org/wiki/Function_prologue_and_epilogue
+
+    // according to GCC, this is how you do a function in m68k:
+    // * linkw %fp,#0
+    // * nop (is this necessary? maybe it's just part of the fn body)
+    //
+    // * <fn body>
+    //
+    // * unlk %fp
+    // * rts
+
+    // but sysV has a different prologue according to
+    // https://media.githubusercontent.com/media/M680x0/Literature/master/sysv-m68k-abi.pdf
+    // it's:
+    // * linkl %fp,&-80
+    // * movem.l %d7/%a5, -(%sp)
+    // * fmovm.x %fp2, -(%sp) (floating point oly, we dont need)
+    //
+    // * <function body>
+    //
+    // * mov.l %a5, %a0
+    // * fmovm.x (%sp+) (floating point only, we dont need)
+    // * movm.l (%sp+), %d7/%a5
+    // * unlk %fp
+    // * rts
+    // (note that the SysV manual says `movm` while the Motorola manual says `movem`)
+
+    // for now i'm doing the one GCC generates but... if that breaks we can try the SysV one
+    if (cc != .Naked) {
+        // linkw %fp,#0
+        _ = try self.addInst(.{
+            .tag = .LINK,
+            .data = .{
+                .register_and_displacement = .{
+                    .register = .a6, // a6 = fp
+                    .displacement = 0,
+                },
+            }
+        });
+
+        // nop
+        _ = try self.addInst(.{
+            .tag = .NOP,
+            .data = .{ .none = {} },
+        });
+
+        try self.genBody(self.air.getMainBody());
+
+        // unlk %fp
+        _ = try self.addInst(.{
+            .tag = .UNLK,
+            .data = .{
+                .register = .a6, // a6 = fp
+            },
+        });
+
+        // rts
+        _ = try self.addInst(.{
+            .tag = .RTS,
+            .data = .{ .none = {} },
+        });
+    } else {
+        try self.genBody(self.air.getMainBody());
+    }
 }
 
 fn genBody(self: *Self, body: []const Air.Inst.Index) InnerError!void {
@@ -307,14 +384,31 @@ fn genBody(self: *Self, body: []const Air.Inst.Index) InnerError!void {
         try self.ensureProcessDeathCapacity(Liveness.bpi);
 
         switch (air_tags[inst]) {
-            // zig fmt: off
-            _ => std.debug.panic("AIR tag is not mplemented for m68k: {}", .{air_tags[inst]})
-            // zig fmt: on
+            .alloc => try self.airAlloc(inst),
+            .arg => try self.airArg(inst),
+            .bitcast => try self.airBitCast(inst),
+            .dbg_block_begin, .dbg_block_end => try self.airDbgBlock(inst),
+            .dbg_stmt => try self.airDbgStmt(inst),
+            .store => try self.airStore(inst),
+            else => std.debug.panic("AIR tag is not implemented for m68k: {}", .{air_tags[inst]})
         }
         if (std.debug.runtime_safety) {
             if (self.air_bookkeeping < old_air_bookkeeping + 1) {
                 std.debug.panic("in CodeGen.zig, handling of AIR instruction %{d} ('{}') did not do proper bookkeeping. Look for a missing call to finishAir.", .{ inst, air_tags[inst] });
             }
+        }
+    }
+}
+
+
+fn getResolvedInstValue(self: *Self, inst: Air.Inst.Index) MCValue {
+    // Treat each stack item as a "layer" on top of the previous one.
+    var i: usize = self.branch_stack.items.len;
+    while (true) {
+        i -= 1;
+        if (self.branch_stack.items[i].inst_table.get(inst)) |mcv| {
+            assert(mcv != .dead);
+            return mcv;
         }
     }
 }
@@ -375,6 +469,124 @@ fn finishAir(self: *Self, inst: Air.Inst.Index, result: MCValue, operands: [Live
     }
     self.finishAirBookkeeping();
 }
+
+fn airAlloc(self: *Self, inst: Air.Inst.Index) !void {
+    const stack_offset = try self.allocMemPtr(inst);
+    return self.finishAir(inst, .{ .ptr_stack_offset = stack_offset }, .{ .none, .none, .none });
+}
+
+fn airArg(self: *Self, inst: Air.Inst.Index) !void {
+    // stolen from ARM pls no break
+    // skip zero-bit arguments as they don't have a corresponding arg instruction
+    var arg_index = self.arg_index;
+    while (self.args[arg_index] == .none) arg_index += 1;
+    self.arg_index = arg_index + 1;
+
+    const result: MCValue = if (self.liveness.isUnused(inst)) .dead else self.args[arg_index];
+    return self.finishAir(inst, result, .{ .none, .none, .none });
+}
+
+fn airBitCast(self: *Self, inst: Air.Inst.Index) !void {
+    const ty_op = self.air.instructions.items(.data)[inst].ty_op;
+    const result = if (self.liveness.isUnused(inst)) .dead else result: {
+        const operand = try self.resolveInst(ty_op.operand);
+        if (self.reuseOperand(inst, ty_op.operand, 0, operand)) break :result operand;
+
+        const operand_lock = switch (operand) {
+            .register => |reg| self.register_manager.lockReg(reg),
+            else => other: {
+                std.debug.print("m68k backend: warning: don't know how to lock operand {}\n", .{operand});
+                break :other null;
+            },
+        };
+        defer if (operand_lock) |lock| self.register_manager.unlockReg(lock);
+
+        const dest_ty = self.air.typeOfIndex(inst);
+        const dest = try self.allocRegOrMem(inst, true);
+        try self.setRegOrMem(dest_ty, dest, operand);
+        break :result dest;
+    };
+    return self.finishAir(inst, result, .{ ty_op.operand, .none, .none });
+}
+
+fn airDbgBlock(self: *Self, inst: Air.Inst.Index) !void {
+    // TODO emit debug info lexical block
+    return self.finishAir(inst, .dead, .{ .none, .none, .none });
+}
+
+
+fn airDbgStmt(self: *Self, inst: Air.Inst.Index) !void {
+    const dbg_stmt = self.air.instructions.items(.data)[inst].dbg_stmt;
+
+    _ = try self.addInst(.{
+        .tag = .dbg_line,
+        .data = .{
+            .dbg_line_column = .{
+                .line = dbg_stmt.line,
+                .column = dbg_stmt.column,
+            },
+        },
+    });
+
+    return self.finishAirBookkeeping();
+}
+
+fn airStore(self: *Self, inst: Air.Inst.Index) !void {
+    const bin_op = self.air.instructions.items(.data)[inst].bin_op;
+    const ptr = try self.resolveInst(bin_op.lhs);
+    const value = try self.resolveInst(bin_op.rhs);
+    const ptr_ty = self.air.typeOf(bin_op.lhs);
+    const value_ty = self.air.typeOf(bin_op.rhs);
+
+    try self.store(ptr, value, ptr_ty, value_ty);
+
+    return self.finishAir(inst, .dead, .{ bin_op.lhs, bin_op.rhs, .none });
+}
+
+
+fn store(self: *Self, ptr: MCValue, value: MCValue, ptr_ty: Type, value_ty: Type) !void {
+    const abi_size = @intCast(u32, value_ty.abiSize(self.target.*));
+
+    switch (ptr) {
+        .none => unreachable,
+        .undef => unreachable,
+        .unreach => unreachable,
+        .dead => unreachable,
+        .immediate => |imm| try self.setRegOrMem(value_ty, .{ .memory = imm }, value),
+        .register => |reg| {
+            switch (value) {
+                .none, .unreach, .dead => unreachable,
+                .undef => {
+                    if (self.wantSafety()) {
+                        switch (abi_size) {
+                            1 => try self.store(ptr, .{ .immediate = 0xAA }, ptr_ty, value_ty),
+                            2 => try self.store(ptr, .{ .immediate = 0xAAAA }, ptr_ty, value_ty),
+                            4 => try self.store(ptr, .{ .immediate = 0xAAAAAAAA }, ptr_ty, value_ty),
+                            else => std.debug.panic("m68k backend: don't know how to store undefined of size {} to register {}", .{ abi_size, reg }),
+                        }
+                    }
+                },
+                .register => |src_reg| {
+                    // MOVE src_reg, reg
+                    _ = try self.addInst(.{
+                        .tag = .MOVE,
+                        .data = .{
+                            .src_dest = .{
+                                .src = .{ .register = src_reg },
+                                .dest = .{ .register = reg },
+                            }
+                        }
+                    });
+                },
+                .immediate => |imm| try self.genSetReg(value_ty, reg, .{ .immediate = imm }),
+                else => std.debug.panic("m68k backend: don't know how to store {} to register {}", .{ value, reg }),
+            }
+        },
+        .ptr_stack_offset => |off| try self.genSetStack(value_ty, off, value),
+        else => std.debug.panic("TODO: m68k backend: implement storing to {}", .{ptr}),
+    }
+}
+
 
 fn ensureProcessDeathCapacity(self: *Self, additional_count: usize) !void {
     const table = &self.branch_stack.items[self.branch_stack.items.len - 1].inst_table;
@@ -487,9 +699,9 @@ fn resolveCallingConventionValues(self: *Self, fn_ty: Type, module: *Module) !Ca
                     //
                     // Maybe we need to panic only if it's the SysV ABI and do something novel for the Zig ABI?
                     std.debug.print(
-                        "TODO: m68k backend: return values ({}, {}) that don't fit in a register " ++
-                        "(try using a pointer)\n",
-                        .{ret_ty.fmt(module), ret_ty.zigTypeTag()} // fmtDebug() doesn't work due to a TODO in src/type.zig
+                        "warning: m68k backend: return values (like the {} here) that don't fit in a register " ++
+                        "might not work properly\n",
+                        .{ret_ty.fmt(module)} // fmtDebug() doesn't work due to a TODO in src/type.zig
                     );
                     stack_offset += 4; // ptr width
                 }
@@ -514,4 +726,277 @@ fn resolveCallingConventionValues(self: *Self, fn_ty: Type, module: *Module) !Ca
     }
 
     return result;
+}
+
+fn allocMem(self: *Self, inst: Air.Inst.Index, abi_size: u32, abi_align: u32) !u32 {
+    if (abi_align > self.stack_align)
+        self.stack_align = abi_align;
+    // TODO find a free slot instead of always appending
+    const offset = mem.alignForwardGeneric(u32, self.next_stack_offset + abi_size, abi_align);
+    self.next_stack_offset = offset;
+    if (self.next_stack_offset > self.max_end_stack)
+        self.max_end_stack = self.next_stack_offset;
+    try self.stack.putNoClobber(self.gpa, offset, .{
+        .inst = inst,
+        .size = abi_size,
+    });
+    return offset;
+}
+
+// Use a pointer instruction as the basis for allocating stack memory.
+fn allocMemPtr(self: *Self, inst: Air.Inst.Index) !u32 {
+    const ptr_ty = self.air.typeOfIndex(inst);
+    const elem_ty = ptr_ty.elemType();
+
+    if (!elem_ty.hasRuntimeBitsIgnoreComptime()) {
+        return self.allocMem(inst, @sizeOf(usize), @alignOf(usize));
+    }
+
+    const abi_size = math.cast(u32, elem_ty.abiSize(self.target.*)) orelse {
+        const mod = self.bin_file.options.module.?;
+        return std.debug.panic(
+            "m68k backend: type '{}' too big to fit into stack frame",
+            .{elem_ty.fmt(mod)},
+        );
+    };
+    // TODO swap this for inst.ty.ptrAlign
+    const abi_align = ptr_ty.ptrAlignment(self.target.*);
+    return self.allocMem(inst, abi_size, abi_align);
+}
+
+fn allocRegOrMem(self: *Self, inst: Air.Inst.Index, reg_ok: bool) !MCValue {
+    const elem_ty = self.air.typeOfIndex(inst);
+    const abi_size = math.cast(u32, elem_ty.abiSize(self.target.*)) orelse {
+        const mod = self.bin_file.options.module.?;
+        return std.debug.panic("m68k: type '{}' too big to fit into stack frame", .{elem_ty.fmt(mod)});
+    };
+    const abi_align = elem_ty.abiAlignment(self.target.*);
+    if (abi_align > self.stack_align)
+        self.stack_align = abi_align;
+
+    if (reg_ok) {
+        // Make sure the type can fit in a register before we try to allocate one.
+        const ptr_bits = self.target.cpu.arch.ptrBitWidth();
+        const ptr_bytes: u64 = @divExact(ptr_bits, 8);
+        if (abi_size <= ptr_bytes) {
+            if (self.register_manager.tryAllocReg(inst, gp)) |reg| {
+                return MCValue{ .register = reg };
+            }
+        }
+    }
+    const stack_offset = try self.allocMem(inst, abi_size, abi_align);
+    return MCValue{ .stack_offset = stack_offset };
+}
+
+
+fn genTypedValue(self: *Self, typed_value: TypedValue) !MCValue {
+    const mcv: MCValue = switch (try codegen.genTypedValue(
+        self.bin_file,
+        self.src_loc,
+        typed_value,
+        self.mod_fn.owner_decl,
+    )) {
+        .mcv => |mcv| switch (mcv) {
+            .none => .none,
+            .undef => .undef,
+            .linker_load => unreachable, // TODO
+            .immediate => |imm| {
+                if (imm >= std.math.pow(u64, 2, 32)) {
+                    std.debug.panic("m68k backend: immediate value {} is greater than 32 bits!", .{imm});
+                }
+                return .{ .immediate = @intCast(u32, imm) };
+            },
+            .memory => |addr| .{ .memory = addr },
+        },
+        .fail => |msg| {
+            // self.err_msg = msg;
+            // return error.CodegenFail;
+            std.debug.panic("m68k backend: couldn't genTypedValue: {}", .{msg});
+        },
+    };
+    return mcv;
+}
+
+
+fn resolveInst(self: *Self, inst: Air.Inst.Ref) !MCValue {
+    // First section of indexes correspond to a set number of constant values.
+    const ref_int = @enumToInt(inst);
+    if (ref_int < Air.Inst.Ref.typed_value_map.len) {
+        const tv = Air.Inst.Ref.typed_value_map[ref_int];
+        if (!tv.ty.hasRuntimeBits()) {
+            return MCValue{ .none = {} };
+        }
+        return self.genTypedValue(tv);
+    }
+
+    // If the type has no codegen bits, no need to store it.
+    const inst_ty = self.air.typeOf(inst);
+    if (!inst_ty.hasRuntimeBits()) {
+        return MCValue{ .none = {} };
+    }
+
+    const inst_index = @intCast(Air.Inst.Index, ref_int - Air.Inst.Ref.typed_value_map.len);
+    switch (self.air.instructions.items(.tag)[inst_index]) {
+        .constant => {
+            // Constants have static lifetimes, so they are always memoized in the outer most table.
+            const branch = &self.branch_stack.items[0];
+            const gop = try branch.inst_table.getOrPut(self.gpa, inst_index);
+            if (!gop.found_existing) {
+                const ty_pl = self.air.instructions.items(.data)[inst_index].ty_pl;
+                gop.value_ptr.* = try self.genTypedValue(.{
+                    .ty = inst_ty,
+                    .val = self.air.values[ty_pl.payload],
+                });
+            }
+            return gop.value_ptr.*;
+        },
+        .const_ty => unreachable,
+        else => return self.getResolvedInstValue(inst_index),
+    }
+}
+
+fn reuseOperand(self: *Self, inst: Air.Inst.Index, operand: Air.Inst.Ref, op_index: Liveness.OperandInt, mcv: MCValue) bool {
+    if (!self.liveness.operandDies(inst, op_index))
+        return false;
+
+    switch (mcv) {
+        .register => |reg| {
+            // If it's in the registers table, need to associate the register with the
+            // new instruction.
+            if (RegisterManager.indexOfRegIntoTracked(reg)) |index| {
+                if (!self.register_manager.isRegFree(reg)) {
+                    self.register_manager.registers[index] = inst;
+                }
+            }
+            log.debug("%{d} => {} (reused)", .{ inst, reg });
+        },
+        .stack_offset => |off| {
+            log.debug("%{d} => stack offset {d} (reused)", .{ inst, off });
+        },
+        else => return false,
+    }
+
+    // Prevent the operand deaths processing code from deallocating it.
+    self.liveness.clearOperandDeath(inst, op_index);
+
+    // That makes us responsible for doing the rest of the stuff that processDeath would have done.
+    const branch = &self.branch_stack.items[self.branch_stack.items.len - 1];
+    branch.inst_table.putAssumeCapacity(Air.refToIndex(operand).?, .dead);
+
+    return true;
+}
+
+/// Sets the value without any modifications to register allocation metadata or stack allocation metadata.
+fn setRegOrMem(self: *Self, ty: Type, loc: MCValue, val: MCValue) !void {
+    switch (loc) {
+        .none => return,
+        .register => |reg| return self.genSetReg(ty, reg, val),
+        .stack_offset => |off| return self.genSetStack(ty, off, val),
+        .memory => std.debug.panic("TODO implement setRegOrMem for memory", .{}),
+        else => unreachable,
+    }
+}
+
+fn genSetStack(self: *Self, ty: Type, stack_offset: u32, mcv: MCValue) !void {
+    _ = self;
+    _ = ty;
+    _ = stack_offset;
+    _ = mcv;
+    std.debug.panic("TODO: m68k backend: implement genSetStack", .{});
+}
+
+fn genSetReg(self: *Self, ty: Type, reg: Register, mcv: MCValue) InnerError!void {
+    const size = ty.abiSize(self.target.*);
+    if (size > 4) {
+        std.debug.panic(
+            "m68k backend: genSetReg called with a value larger than one register (32 bits): size was {} bits.",
+            .{size * 8}
+        );
+    }
+
+    switch (mcv) {
+        .dead, .unreach => unreachable,
+        .none => return,
+        .undef => {
+            if (self.wantSafety()) {
+                // Write the debug undefined value.
+                // All m68k registers are 32 bits wide, so it's always 0xAAAAAAAA.
+                return self.genSetReg(ty, reg, .{ .immediate = 0xAAAAAAAA });
+            }
+            // We don't need to do anything if we don't need safety —
+            // programs should handle *any* possible register contents!
+        },
+        .immediate => {
+            // OPTIMIZATION: What's the fastest way to set a register to a value?
+            // can also add an `if` here to easily set 0xFFFF via an OR instruction
+
+            // Zero the register...
+            try self.genZeroRegister(reg);
+
+            // ...and then add the immediate if it's not zero
+            if (mcv.immediate != 0) {
+                _ = try self.addInst(.{
+                    .tag = .ADDI, // Add Immediate
+                    .data = .{
+                        .immediate_and_register_or_address = .{
+                            .immediate = mcv.immediate,
+                            .register_or_address = .{ .register = reg },
+                        },
+                    }
+                });
+            }
+        },
+        .register => |src_reg| {
+            if (src_reg.id() != reg.id()) {
+                // MOVE reg, src_reg
+                _ = try self.addInst(.{
+                    .tag = .MOVE,
+                    .data = .{
+                        .src_dest = .{
+                            .src = .{ .register = src_reg },
+                            .dest = .{ .register = reg },
+                        },
+                    }
+                });
+            }
+        },
+        .ptr_stack_offset => |off| {
+            // OPTIMIZATION: can we add the offset to LEA?
+            // LEA (%sp), reg
+            _ = try self.addInst(.{
+                .tag = .LEA,
+                .data = .{
+                    .register_and_address_mode = .{
+                        .address_mode = .{ .address_in_register = .a7 },
+                        .register = reg,
+                    },
+                }
+            });
+
+            // ADDI off, reg
+            _ = try self.addInst(.{
+                .tag = .ADDI,
+                .data = .{
+                    .immediate_and_register_or_address = .{
+                        .immediate = off,
+                        .register_or_address = .{ .register = reg },
+                    },
+                }
+            });
+        },
+        else => std.debug.panic("TODO: m68k backend: implement genSetReg for MCValues like {}", .{ mcv }),
+    }
+}
+
+fn genZeroRegister(self: *Self, reg: Register) !void {
+    // Zero the register by bitwise ANDing it with 0.
+    _ = try self.addInst(.{
+        .tag = .ANDI, // AND Immediate
+        .data = .{
+            .immediate_and_register_or_address = .{
+                .immediate = 0,
+                .register_or_address = .{ .register = reg },
+            },
+        }
+    });
 }

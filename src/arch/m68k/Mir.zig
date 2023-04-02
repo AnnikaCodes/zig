@@ -1,5 +1,6 @@
 // TODO
 const std = @import("std");
+const Register = @import("bits.zig").Register;
 
 instructions: std.MultiArrayList(Inst).Slice,
 /// The meaning of this data is determined by `Inst.Tag` value.
@@ -7,9 +8,24 @@ extra: []const u32,
 
 const Mir = @This();
 
+pub const RegisterOrAddress = union {
+    register: Register,
+    address: u32,
+};
+
+pub const AddressMode = union {
+    register: Register,
+    address_in_register: Register,
+    address_in_register_postincrement: Register,
+    address_in_register_predecrement: Register,
+    immediate: u32,
+    address: u32,
+};
+
 pub const Inst = struct {
     // TODO
     tag: Tag,
+    data: Data,
     pub const Index = u32;
     pub const Tag = enum {
         // Yes, the capitalization is inconsistent.
@@ -25,7 +41,12 @@ pub const Inst = struct {
         ADD,
         // Add address
         ADDA,
-        // Add immediate
+        /// Add immediate
+        ///
+        /// ADDI #imm, Dn
+        /// or ADDI #imm, <address>
+        ///
+        /// Data is an immediate_and_register_or_address struct
         ADDI,
         // Add quick
         ADDQ,
@@ -34,7 +55,12 @@ pub const Inst = struct {
 
         // And
         AND,
-        // And immediate
+        /// And immediate
+        ///
+        /// ANDI #imm, Dn
+        /// or ANDI #imm, <address>
+        ///
+        /// Data is an immediate_and_register_or_address.
         ANDI,
         // And immediate to CCR
         ANDI_to_CCR,
@@ -112,10 +138,18 @@ pub const Inst = struct {
         // Jump to subroutine
         JSR,
 
-        // Load effective address
+        /// Load effective address
+        ///
+        /// LEA <ea>, An
+        ///
+        /// Data is a `register_and_address_mode` struct.
         LEA,
 
-        // Link and allocate
+        /// Link and allocate
+        ///
+        /// LINK An, #<displacement>
+        ///
+        /// Data is a `register_and_displacement` struct.
         LINK,
 
         // Logical shift left
@@ -123,7 +157,11 @@ pub const Inst = struct {
         // Logical shift right
         LSR,
 
-        // Move data from source to destination
+        /// Move data from source to destination
+        ///
+        /// MOVE <source>, <destination>
+        ///
+        /// Data is a `src_dest`.
         MOVE,
         // Move address
         MOVEA,
@@ -148,8 +186,13 @@ pub const Inst = struct {
         // Negate with extend
         NEGX,
 
-        // No operation
+        /// No operation
+        ///
+        /// NOP
+        ///
+        /// Data is a `none`.
         NOP,
+
 
         // Logical complement
         NOT,
@@ -175,7 +218,11 @@ pub const Inst = struct {
 
         // Return and restore condition codes
         RTR,
-        // Return from subroutine
+        /// Return from subroutine
+        ///
+        /// RTS
+        ///
+        /// Data is a `none`.
         RTS,
 
         // Subtract decimal with extend
@@ -209,11 +256,67 @@ pub const Inst = struct {
         // Test an operand
         TST,
 
-        // Unlink
+        /// Unlink
+        ///
+        /// UNLK An
+        ///
+        /// Data is a Register.
         UNLK,
 
         // Move from SR
         MOVE_from_SR,
+
+        /// Pseudo-instruction: End of prologue
+        dbg_prologue_end,
+        /// Pseudo-instruction: Beginning of epilogue
+        dbg_epilogue_begin,
+        /// Pseudo-instruction: Update debug line
+        dbg_line,
+    };
+
+    pub const Data = union {
+        /// No data.
+        none: void,
+
+        /// A register.
+        register: Register,
+
+        /// A register and a displacement value (1 word - ie an unsigned 16 bit integer)
+        register_and_displacement: struct {
+            register: Register,
+            displacement: u16,
+        },
+
+        /// A register and an address mode.
+        ///
+        /// Used by e.g. LEA
+        register_and_address_mode: struct {
+            register: Register,
+            address_mode: AddressMode,
+        },
+
+        /// Debug info: line and column
+        ///
+        /// Used by e.g. dbg_line
+        dbg_line_column: struct {
+            line: u32,
+            column: u32,
+        },
+
+        /// Immediate value and a register or address
+        ///
+        /// Used by e.g. ADDI
+        immediate_and_register_or_address: struct {
+            immediate: u32,
+            register_or_address: RegisterOrAddress,
+        },
+
+        /// Source and destination
+        /// Used by e.g. MOVE
+        src_dest: struct {
+            src: AddressMode,
+            dest: AddressMode,
+        },
     };
 };
 
