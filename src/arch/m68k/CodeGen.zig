@@ -113,7 +113,7 @@ const MCValue = union(enum) {
     register: Register,
     /// The value is in memory at a hard-coded address.
     /// If the type is a pointer, it means the pointer address is at this memory location.
-    memory: u64,
+    memory: u32,
     /// The value is one of the stack variables.
     /// If the type is a pointer, it means the pointer address is in the stack at this offset.
     stack_offset: u32,
@@ -376,6 +376,19 @@ fn gen(self: *Self) !void {
     }
 }
 
+
+fn performReloc(self: *Self, inst: Mir.Inst.Index) !void {
+    const tag = self.mir_instructions.items(.tag)[inst];
+    switch (tag) {
+        // TODO: does this even work?
+        .JMP => {
+            self.mir_instructions.items(.data)[inst].inst = @intCast(Mir.Inst.Index, self.mir_instructions.len);
+        },
+        else => std.debug.panic("TODO performReloc for tag {}", .{tag}),
+    }
+}
+
+
 fn genBody(self: *Self, body: []const Air.Inst.Index) InnerError!void {
     const air_tags = self.air.instructions.items(.tag);
 
@@ -384,13 +397,28 @@ fn genBody(self: *Self, body: []const Air.Inst.Index) InnerError!void {
         try self.ensureProcessDeathCapacity(Liveness.bpi);
 
         switch (air_tags[inst]) {
-            .alloc => try self.airAlloc(inst),
-            .arg => try self.airArg(inst),
-            .bitcast => try self.airBitCast(inst),
-            .dbg_block_begin, .dbg_block_end => try self.airDbgBlock(inst),
-            .dbg_stmt => try self.airDbgStmt(inst),
-            .store => try self.airStore(inst),
-            else => std.debug.panic("AIR tag is not implemented for m68k: {}", .{air_tags[inst]})
+            .alloc              => try self.airAlloc(inst),
+            .arg                => try self.airArg(inst),
+            .bitcast            => try self.airBitCast(inst),
+            .block              => try self.airBlock(inst),
+
+            .dbg_block_begin,
+            .dbg_block_end      => try self.airDbgBlock(inst),
+
+            .dbg_stmt           => try self.airDbgStmt(inst),
+
+            .dbg_var_ptr,
+            .dbg_var_val        => try self.airDbgVar(inst),
+
+            .load               => try self.airLoad(inst),
+            .loop               => try self.airLoop(inst),
+            .store              => try self.airStore(inst),
+            .slice_len          => try self.airSliceLen(inst),
+
+            else => std.debug.panic(
+                "m68k backend: lowering for AIR tag {} is not yet implemented",
+                .{air_tags[inst]},
+            ),
         }
         if (std.debug.runtime_safety) {
             if (self.air_bookkeeping < old_air_bookkeeping + 1) {
@@ -509,11 +537,46 @@ fn airBitCast(self: *Self, inst: Air.Inst.Index) !void {
     return self.finishAir(inst, result, .{ ty_op.operand, .none, .none });
 }
 
+
+// copied from aarch64
+fn airBlock(self: *Self, inst: Air.Inst.Index) !void {
+    try self.blocks.putNoClobber(self.gpa, inst, .{
+        // A block is a setup to be able to jump to the end.
+        .relocs = .{},
+        // It also acts as a receptacle for break operands.
+        // Here we use `MCValue.none` to represent a null value so that the first
+        // break instruction will choose a MCValue for the block result and overwrite
+        // this field. Following break instructions will use that MCValue to put their
+        // block results.
+        .mcv = MCValue{ .none = {} },
+    });
+    defer self.blocks.getPtr(inst).?.relocs.deinit(self.gpa);
+
+    const ty_pl = self.air.instructions.items(.data)[inst].ty_pl;
+    const extra = self.air.extraData(Air.Block, ty_pl.payload);
+    const body = self.air.extra[extra.end..][0..extra.data.body_len];
+    try self.genBody(body);
+
+    // relocations for `br` instructions
+    const relocs = &self.blocks.getPtr(inst).?.relocs;
+    if (relocs.items.len > 0 and relocs.items[relocs.items.len - 1] == self.mir_instructions.len - 1) {
+        // If the last Mir instruction is the last relocation (which
+        // would just jump one instruction further), it can be safely
+        // removed
+        self.mir_instructions.orderedRemove(relocs.pop());
+    }
+    for (relocs.items) |reloc| {
+        try self.performReloc(reloc);
+    }
+
+    const result = self.blocks.getPtr(inst).?.mcv;
+    return self.finishAir(inst, result, .{ .none, .none, .none });
+}
+
 fn airDbgBlock(self: *Self, inst: Air.Inst.Index) !void {
     // TODO emit debug info lexical block
     return self.finishAir(inst, .dead, .{ .none, .none, .none });
 }
-
 
 fn airDbgStmt(self: *Self, inst: Air.Inst.Index) !void {
     const dbg_stmt = self.air.instructions.items(.data)[inst].dbg_stmt;
@@ -531,6 +594,53 @@ fn airDbgStmt(self: *Self, inst: Air.Inst.Index) !void {
     return self.finishAirBookkeeping();
 }
 
+fn airDbgVar(self: *Self, inst: Air.Inst.Index) !void {
+    const pl_op = self.air.instructions.items(.data)[inst].pl_op;
+    const name = self.air.nullTerminatedString(pl_op.payload);
+    const operand = pl_op.operand;
+    // TODO emit debug info for this variable
+    _ = name;
+    return self.finishAir(inst, .dead, .{ operand, .none, .none });
+}
+
+/// Load a value from a pointer
+fn airLoad(self: *Self, inst: Air.Inst.Index) !void {
+    const ty_op = self.air.instructions.items(.data)[inst].ty_op;
+    const elem_ty = self.air.typeOfIndex(inst);
+    const result: MCValue = result: {
+        if (!elem_ty.hasRuntimeBits())
+            break :result MCValue.none;
+
+        const ptr = try self.resolveInst(ty_op.operand);
+        const is_volatile = self.air.typeOf(ty_op.operand).isVolatilePtr();
+        if (self.liveness.isUnused(inst) and !is_volatile)
+            break :result MCValue.dead;
+
+        const dst_mcv: MCValue = blk: {
+            if (self.reuseOperand(inst, ty_op.operand, 0, ptr)) {
+                // The MCValue that holds the pointer can be re-used as the value.
+                break :blk ptr;
+            } else {
+                break :blk try self.allocRegOrMem(inst, true);
+            }
+        };
+        try self.load(dst_mcv, ptr, self.air.typeOf(ty_op.operand));
+        break :result dst_mcv;
+    };
+    return self.finishAir(inst, result, .{ ty_op.operand, .none, .none });
+}
+
+fn airLoop(self: *Self, inst: Air.Inst.Index) !void {
+    // A loop is a setup to be able to jump back to the beginning.
+    const ty_pl = self.air.instructions.items(.data)[inst].ty_pl;
+    const loop = self.air.extraData(Air.Block, ty_pl.payload);
+    const body = self.air.extra[loop.end..][0..loop.data.body_len];
+    const start_index = @intCast(Mir.Inst.Index, self.mir_instructions.len);
+    try self.genBody(body);
+    try self.jump(start_index);
+    return self.finishAirBookkeeping();
+}
+
 fn airStore(self: *Self, inst: Air.Inst.Index) !void {
     const bin_op = self.air.instructions.items(.data)[inst].bin_op;
     const ptr = try self.resolveInst(bin_op.lhs);
@@ -543,6 +653,23 @@ fn airStore(self: *Self, inst: Air.Inst.Index) !void {
     return self.finishAir(inst, .dead, .{ bin_op.lhs, bin_op.rhs, .none });
 }
 
+fn airSliceLen(self: *Self, inst: Air.Inst.Index) !void {
+    const ty_op = self.air.instructions.items(.data)[inst].ty_op;
+    const result: MCValue = if (self.liveness.isUnused(inst)) .dead else result: {
+        const mcv = try self.resolveInst(ty_op.operand);
+        switch (mcv) {
+            .dead, .unreach, .none => unreachable,
+            .stack_offset => |off| {
+                break :result MCValue{ .stack_offset = off - 4 };
+            },
+            .memory => |addr| {
+                break :result MCValue{ .memory = addr + 4 };
+            },
+            else => std.debug.panic("TODO: m68k backend: implement slice_len for {}", .{mcv}),
+        }
+    };
+    return self.finishAir(inst, result, .{ ty_op.operand, .none, .none });
+}
 
 fn store(self: *Self, ptr: MCValue, value: MCValue, ptr_ty: Type, value_ty: Type) !void {
     const abi_size = @intCast(u32, value_ty.abiSize(self.target.*));
@@ -579,6 +706,7 @@ fn store(self: *Self, ptr: MCValue, value: MCValue, ptr_ty: Type, value_ty: Type
                     });
                 },
                 .immediate => |imm| try self.genSetReg(value_ty, reg, .{ .immediate = imm }),
+                .memory => |addr| try self.genSetReg(value_ty, reg, .{ .memory = addr }),
                 else => std.debug.panic("m68k backend: don't know how to store {} to register {}", .{ value, reg }),
             }
         },
@@ -806,7 +934,7 @@ fn genTypedValue(self: *Self, typed_value: TypedValue) !MCValue {
                 }
                 return .{ .immediate = @intCast(u32, imm) };
             },
-            .memory => |addr| .{ .memory = addr },
+            .memory => |addr| return .{ .memory = @intCast(u32, addr) },
         },
         .fail => |msg| {
             // self.err_msg = msg;
@@ -897,22 +1025,63 @@ fn setRegOrMem(self: *Self, ty: Type, loc: MCValue, val: MCValue) !void {
     }
 }
 
+pub fn spillInstruction(self: *Self, reg: Register, inst: Air.Inst.Index) !void {
+    const stack_mcv = try self.allocRegOrMem(inst, false);
+    log.debug("spilling {d} to stack mcv {any}", .{ inst, stack_mcv });
+    const reg_mcv = self.getResolvedInstValue(inst);
+    assert(reg == reg_mcv.register);
+    const branch = &self.branch_stack.items[self.branch_stack.items.len - 1];
+    try branch.inst_table.put(self.gpa, inst, stack_mcv);
+    try self.genSetStack(self.air.typeOfIndex(inst), stack_mcv.stack_offset, reg_mcv);
+}
+
+
 fn genSetStack(self: *Self, ty: Type, stack_offset: u32, mcv: MCValue) !void {
-    _ = self;
-    _ = ty;
-    _ = stack_offset;
-    _ = mcv;
-    std.debug.panic("TODO: m68k backend: implement genSetStack", .{});
+    switch (mcv) {
+        .dead => unreachable,
+        .unreach, .none => return, // Nothing to do.
+        .immediate, .ptr_stack_offset => {
+            const reg = try self.copyToTmpRegister(ty, mcv);
+            return self.genSetStack(ty, stack_offset, MCValue{ .register = reg });
+        },
+        .register => |reg| {
+            // MOVE reg, (%sp) + stack_offset
+            _ = try self.addInst(.{
+                .tag = .MOVE,
+                .data = .{ .src_dest = .{
+                    .src = .{ .register = reg },
+                    .dest = .{ .address_in_register_plus_offset = .{
+                        .register = .a7, // sp
+                        .offset = stack_offset,
+                    }},
+                }},
+            });
+        },
+        else => std.debug.panic(
+            "TODO: m68k backend: implement genSetStack(???, {}, {})\n",
+            .{stack_offset, mcv}
+        ),
+    }
+}
+
+/// Copies a value to a register without tracking the register. The register is not considered
+/// allocated. A second call to `copyToTmpRegister` may return the same register.
+/// This can have a side effect of spilling instructions to the stack to free up a register.
+fn copyToTmpRegister(self: *Self, ty: Type, mcv: MCValue) !Register {
+    const reg = try self.register_manager.allocReg(null, gp);
+    try self.genSetReg(ty, reg, mcv);
+    return reg;
 }
 
 fn genSetReg(self: *Self, ty: Type, reg: Register, mcv: MCValue) InnerError!void {
-    const size = ty.abiSize(self.target.*);
-    if (size > 4) {
-        std.debug.panic(
-            "m68k backend: genSetReg called with a value larger than one register (32 bits): size was {} bits.",
-            .{size * 8}
-        );
-    }
+    // const size = ty.abiSize(self.target.*);
+    // if (size > 4) {
+    //     std.debug.panic(
+    //         "m68k backend: genSetReg called with a value larger than one register (32 bits): size was {} bits.\n" ++
+    //         "value was '{}'\n",
+    //         .{size * 8, mcv},
+    //     );
+    // }
 
     switch (mcv) {
         .dead, .unreach => unreachable,
@@ -984,7 +1153,36 @@ fn genSetReg(self: *Self, ty: Type, reg: Register, mcv: MCValue) InnerError!void
                 }
             });
         },
-        else => std.debug.panic("TODO: m68k backend: implement genSetReg for MCValues like {}", .{ mcv }),
+        .memory => |addr| {
+            // LEA addr, reg
+            _ = try self.addInst(.{
+                .tag = .LEA,
+                .data = .{
+                    .register_and_address_mode = .{
+                        .address_mode = .{ .address = addr },
+                        .register = reg,
+                    },
+                }
+            });
+        },
+
+        .stack_offset => |off| {
+            // MOVE (%sp) + off, reg
+            _ = try self.addInst(.{
+                .tag = .MOVE,
+                .data = .{
+                    .src_dest = .{
+                        .src = .{ .address_in_register_plus_offset = .{
+                            .register = .a7, // sp
+                            .offset = off,
+                        }},
+                        .dest = .{ .register = reg },
+                    },
+                }
+            });
+        },
+
+        // else => std.debug.panic("TODO: m68k backend: implement genSetReg for MCValues like {}", .{ mcv }),
     }
 }
 
@@ -999,4 +1197,34 @@ fn genZeroRegister(self: *Self, reg: Register) !void {
             },
         }
     });
+}
+
+/// Jump!
+fn jump(self: *Self, inst: Mir.Inst.Index) !void {
+    _ = try self.addInst(.{
+        .tag = .JMP,
+        .data = .{ .inst = inst },
+    });
+}
+
+
+fn load(self: *Self, dst_mcv: MCValue, ptr: MCValue, ptr_ty: Type) !void {
+    const elem_ty = ptr_ty.elemType();
+    switch (ptr) {
+        .none => unreachable,
+        .undef => unreachable,
+        .unreach => unreachable,
+        .dead => unreachable,
+        .immediate => |imm| try self.setRegOrMem(elem_ty, dst_mcv, .{ .memory = imm }),
+        .ptr_stack_offset => |off| try self.setRegOrMem(elem_ty, dst_mcv, .{ .stack_offset = off }),
+        .memory, .stack_offset => {
+            const reg = try self.register_manager.allocReg(null, gp);
+            const reg_lock = self.register_manager.lockRegAssumeUnused(reg);
+            defer self.register_manager.unlockReg(reg_lock);
+
+            try self.genSetReg(ptr_ty, reg, ptr);
+            try self.load(dst_mcv, .{ .register = reg }, ptr_ty);
+        },
+        else => std.debug.panic("TODO: m68k backend: implement load for MCValues like {}", .{ ptr }),
+    }
 }

@@ -16,6 +16,10 @@ pub const RegisterOrAddress = union {
 pub const AddressMode = union {
     register: Register,
     address_in_register: Register,
+    address_in_register_plus_offset: struct {
+        register: Register,
+        offset: u32,
+    },
     address_in_register_postincrement: Register,
     address_in_register_predecrement: Register,
     immediate: u32,
@@ -280,6 +284,9 @@ pub const Inst = struct {
 
         /// A register.
         register: Register,
+
+        /// References another Mir instruction.
+        inst: Index,
 
         /// A register and a displacement value (1 word - ie an unsigned 16 bit integer)
         register_and_displacement: struct {
