@@ -26,6 +26,41 @@ pub const AddressMode = union {
     address: u32,
 };
 
+pub const ConditionCode = enum {
+    /// Carry Clear
+    cc_hi,
+    /// Carry Set
+    cs_lo,
+    /// Equal
+    eq,
+    /// False
+    f,
+    /// Greater or Equal
+    ge,
+    /// Greater Than
+    gt,
+    /// High
+    hi,
+    /// Less or Equal
+    le,
+    /// Low or Same
+    ls,
+    /// Less Than
+    lt,
+    /// Minus
+    mi,
+    /// Not Equal
+    ne,
+    /// Plus
+    pl,
+    /// True
+    t,
+    /// Overflow Clear
+    vc,
+    /// Overflow Set
+    vs,
+};
+
 pub const Inst = struct {
     // TODO
     tag: Tag,
@@ -100,7 +135,11 @@ pub const Inst = struct {
         // Clear an operand
         CLR,
 
-        // Compare
+        /// Compare
+        ///
+        /// CMP <ea>, Dn
+        ///
+        /// Data is a `register_and_address_mode` struct.
         CMP,
         // Compare address
         CMPA,
@@ -197,7 +236,6 @@ pub const Inst = struct {
         /// Data is a `none`.
         NOP,
 
-
         // Logical complement
         NOT,
 
@@ -232,7 +270,11 @@ pub const Inst = struct {
         // Subtract decimal with extend
         SBCD,
 
-        // Set according to condition
+        /// Set according to condition
+        ///
+        /// Scc <ea>
+        ///
+        /// Data is a `condition_code_and_address_mode` struct.
         Scc,
 
         // Subtract
@@ -323,6 +365,13 @@ pub const Inst = struct {
         src_dest: struct {
             src: AddressMode,
             dest: AddressMode,
+        },
+
+        /// Condition code and address mode
+        /// Used by e.g. Scc
+        condition_code_and_address_mode: struct {
+            condition_code: ConditionCode,
+            address: AddressMode,
         },
     };
 };

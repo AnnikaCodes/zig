@@ -380,7 +380,8 @@ fn gen(self: *Self) !void {
 fn performReloc(self: *Self, inst: Mir.Inst.Index) !void {
     const tag = self.mir_instructions.items(.tag)[inst];
     switch (tag) {
-        // TODO: does this even work?
+        // TODO: does this even work? should we use jsr?
+        // Optimization: use a BRA instead: https://mrjester.hapisan.com/04_MC68/Sect05Part03/Index.html
         .JMP => {
             self.mir_instructions.items(.data)[inst].inst = @intCast(Mir.Inst.Index, self.mir_instructions.len);
         },
@@ -401,6 +402,13 @@ fn genBody(self: *Self, body: []const Air.Inst.Index) InnerError!void {
             .arg                => try self.airArg(inst),
             .bitcast            => try self.airBitCast(inst),
             .block              => try self.airBlock(inst),
+
+            .cmp_lt             => try self.airCmp(inst, .lt),
+            .cmp_lte            => try self.airCmp(inst, .lte),
+            .cmp_eq             => try self.airCmp(inst, .eq),
+            .cmp_gte            => try self.airCmp(inst, .gte),
+            .cmp_gt             => try self.airCmp(inst, .gt),
+            .cmp_neq            => try self.airCmp(inst, .neq),
 
             .dbg_block_begin,
             .dbg_block_end      => try self.airDbgBlock(inst),
@@ -571,6 +579,91 @@ fn airBlock(self: *Self, inst: Air.Inst.Index) !void {
 
     const result = self.blocks.getPtr(inst).?.mcv;
     return self.finishAir(inst, result, .{ .none, .none, .none });
+}
+
+fn airCmp(self: *Self, inst: Air.Inst.Index, op: math.CompareOperator) !void {
+    const bin_op = self.air.instructions.items(.data)[inst].bin_op;
+    const lhs_ty = self.air.typeOf(bin_op.lhs);
+
+    const result: MCValue = if (self.liveness.isUnused(inst)) .dead else blk: {
+        const lhs = try self.resolveInst(bin_op.lhs);
+        const rhs = try self.resolveInst(bin_op.rhs);
+        break :blk try self.cmp(lhs, rhs, lhs_ty, op, inst);
+    };
+
+    return self.finishAir(inst, result, .{ bin_op.lhs, bin_op.rhs, .none });
+}
+
+fn cmp(
+    self: *Self,
+    lhs: MCValue,
+    rhs: MCValue,
+    lhs_ty: Type,
+    op: math.CompareOperator,
+    inst: Air.Inst.Index,
+) !MCValue {
+    const ty_tag = lhs_ty.zigTypeTag();
+    if (ty_tag != .Int) {
+        std.debug.panic("m68k backend: don't know how to compare types {}", .{ty_tag});
+    }
+
+    const lhs_reg = try self.copyToTmpRegister(lhs_ty, lhs);
+    const output = try self.allocRegOrMem(inst, true);
+
+    _ = try self.addInst(.{
+        .tag = .CMP,
+        .data = .{
+            .register_and_address_mode = .{
+                .register = lhs_reg,
+                .address_mode = self.mcvToAddressMode(rhs),
+            },
+        },
+    });
+
+    const setInst: Mir.ConditionCode = switch (op) {
+        .eq => .eq,
+        .neq => .ne,
+        .lt => .lt,
+        .gt => .gt,
+        .lte => .le,
+        .gte => .ge,
+    };
+
+    _ = try self.addInst(.{
+        .tag = .Scc,
+        .data = .{
+            .condition_code_and_address_mode = .{
+                .condition_code = setInst,
+                .address = self.mcvToAddressMode(output),
+            },
+        },
+    });
+
+    return output;
+}
+
+fn mcvToAddressMode(self: *Self, mcv: MCValue) Mir.AddressMode {
+    _ = self;
+    return switch (mcv) {
+        .register => |reg| Mir.AddressMode{ .register = reg },
+        .memory => |addr| Mir.AddressMode{ .address = addr },
+        .stack_offset => |offset| Mir.AddressMode{
+            .address_in_register_plus_offset = .{
+                .register = .a7, // sp
+                .offset = offset,
+            },
+        },
+        else => std.debug.panic("m68k backend: can't convert MCValue {} to AddressMode", .{mcv}),
+    };
+}
+
+fn addressModeToMCV(self: *Self, mode: Mir.AddressMode) MCValue {
+    _ = self;
+    return switch (mode) {
+        .register => |reg| MCValue{ .register = reg },
+        .address => |addr| MCValue{ .memory = addr },
+        else => std.debug.panic("m68k backend: can't convert AddressMode {} to MCValue", .{mode}),
+    };
 }
 
 fn airDbgBlock(self: *Self, inst: Air.Inst.Index) !void {
